@@ -1,19 +1,24 @@
 use std::cmp::Ordering;
 
-use biome_rowan::{AstNode, AstNodeList, AstSeparatedList, SyntaxNodeText, TokenText};
+#[cfg(test)]
+use biome_rowan::AstSeparatedList;
+use biome_rowan::{AstNode, AstNodeList, SyntaxNodeText, TokenText};
 use biome_string_case::Collator;
 use biome_tailwind_syntax::{
     AnyTwCandidate, AnyTwFullCandidate, AnyTwModifier, AnyTwValue, CssGenericComponentValueList,
-    TwRoot,
+    TwFullCandidate, TwRoot,
 };
 
+use super::arbitrary_value_match::value_matches_type;
+use super::sort_v4_variants::{
+    VariantBits, VariantGroups, VariantKey, variant_keys_from_candidate,
+};
 use super::tailwind_preset_v4::{
     FUNCTIONAL_UTILITIES, KEYWORD_POOL, PROPERTY_INDEX, SIGNATURE_POOL, STATIC_UTILITIES,
 };
 use super::tailwind_preset_v4_types::{
     ArbitraryBranch, NamedBranch, NamedValueType, Negative, UtilityEntry,
 };
-use super::arbitrary_value_match::value_matches_type;
 
 #[cfg(test)]
 use super::tailwind_preset_v4_types::{CssDataType, ThemeNamespace};
@@ -22,12 +27,26 @@ use super::tailwind_preset_v4_types::{CssDataType, ThemeNamespace};
 /// space-separated result.
 pub fn sort_class_list(root: &TwRoot) -> String {
     let candidates = root.candidates();
-    let mut keyed: Vec<(SortKey, SyntaxNodeText)> = Vec::with_capacity(candidates.len());
+    let mut pending: Vec<(PendingSortKey, SyntaxNodeText)> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let text = candidate.syntax().text_trimmed();
-        let key = SortKey::from_candidate(&candidate);
-        keyed.push((key, text));
+        let key = PendingSortKey::from_candidate(&candidate);
+        pending.push((key, text));
     }
+
+    let variant_groups = VariantGroups::new(
+        pending
+            .iter()
+            .filter_map(|(key, _)| match key {
+                PendingSortKey::Known { variants, .. } => Some(variants.as_slice()),
+                PendingSortKey::Unknown => None,
+            })
+            .flatten(),
+    );
+    let mut keyed: Vec<(SortKey, SyntaxNodeText)> = pending
+        .into_iter()
+        .map(|(key, text)| (key.into_sort_key(&variant_groups), text))
+        .collect();
 
     // `Vec::sort_by` is stable, so Unknown-vs-Unknown comparisons returning
     // `Equal` keep input order, and Known entries with identical keys
@@ -52,6 +71,7 @@ pub fn sort_class_list(root: &TwRoot) -> String {
 enum SortKey {
     Unknown,
     Known {
+        variant_bits: VariantBits,
         signature: Signature,
         /// Total declaration count — Tailwind's tie-break after the
         /// signature (wider utilities sort first).
@@ -59,6 +79,23 @@ enum SortKey {
         name: NameKey,
         important: bool,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingSortKey {
+    Unknown,
+    Known {
+        utility: UtilitySortKey,
+        variants: Vec<VariantKey>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UtilitySortKey {
+    signature: Signature,
+    count: u8,
+    name: NameKey,
+    important: bool,
 }
 
 /// The set of CSS properties a candidate's declarations set, encoded as
@@ -152,7 +189,12 @@ impl NameKey {
     fn compare(&self, other: &Self) -> Ordering {
         fn chars(key: &NameKey) -> impl Iterator<Item = char> + '_ {
             let sign = key.negative.then_some('-');
-            let text = key.text.as_ref().map(|text| text.chars()).into_iter().flatten();
+            let text = key
+                .text
+                .as_ref()
+                .map(|text| text.chars())
+                .into_iter()
+                .flatten();
             sign.into_iter().chain(text)
         }
         TwNameCollator.cmp(chars(self), chars(other))
@@ -181,33 +223,80 @@ impl Collator for TwNameCollator {
     }
 }
 
+#[cfg(test)]
 impl SortKey {
-    /// Build a sort key from a parsed candidate. Returns `Unknown` for
-    /// shapes we cannot yet place; each `// TODO:` below tags an input
-    /// class awaiting follow-up implementation.
     fn from_candidate(candidate: &AnyTwFullCandidate) -> Self {
         let AnyTwFullCandidate::TwFullCandidate(node) = candidate else {
             return Self::Unknown;
         };
 
-        // TODO: variant weight (`hover:`, `sm:`, `[&:hover]:`).
         if !node.variants().is_empty() {
             return Self::Unknown;
         }
 
+        let Some(utility) = UtilitySortKey::from_candidate(node) else {
+            return Self::Unknown;
+        };
+
+        Self::Known {
+            variant_bits: VariantBits::default(),
+            signature: utility.signature,
+            count: utility.count,
+            name: utility.name,
+            important: utility.important,
+        }
+    }
+}
+
+impl PendingSortKey {
+    fn from_candidate(candidate: &AnyTwFullCandidate) -> Self {
+        let AnyTwFullCandidate::TwFullCandidate(node) = candidate else {
+            return Self::Unknown;
+        };
+
+        let Some(variants) = variant_keys_from_candidate(node) else {
+            return Self::Unknown;
+        };
+        let Some(utility) = UtilitySortKey::from_candidate(node) else {
+            return Self::Unknown;
+        };
+
+        Self::Known { utility, variants }
+    }
+
+    fn into_sort_key(self, variant_groups: &VariantGroups) -> SortKey {
+        match self {
+            Self::Unknown => SortKey::Unknown,
+            Self::Known { utility, variants } => {
+                let Some(variant_bits) = variant_groups.bits_for(&variants) else {
+                    return SortKey::Unknown;
+                };
+                SortKey::Known {
+                    variant_bits,
+                    signature: utility.signature,
+                    count: utility.count,
+                    name: utility.name,
+                    important: utility.important,
+                }
+            }
+        }
+    }
+}
+
+impl UtilitySortKey {
+    /// Build a sort key from a parsed candidate. Returns `Unknown` for
+    /// shapes we cannot yet place; each `// TODO:` below tags an input
+    /// class awaiting follow-up implementation.
+    fn from_candidate(node: &TwFullCandidate) -> Option<Self> {
         let is_negative = node.negative_token().is_some();
         // An important candidate (`flex!`) sorts exactly where its plain
         // twin does; `compare` breaks exact-key ties plain-first.
         let is_important = node.excl_token().is_some();
 
-        let Ok(inner) = node.candidate() else {
-            return Self::Unknown;
-        };
+        let inner = node.candidate().ok()?;
         let placement = match &inner {
             AnyTwCandidate::TwArbitraryCandidate(a) => {
-                let Ok(property_token) = a.property_token() else {
-                    return Self::Unknown;
-                };
+                let property_token = a.property_token().ok()?;
                 PROPERTY_INDEX
                     .get(property_token.text_trimmed())
                     .map(|&property_idx| (Signature::Property(property_idx), 1))
@@ -215,9 +304,7 @@ impl SortKey {
             AnyTwCandidate::TwBogusCandidate(_) => None,
 
             AnyTwCandidate::TwStaticCandidate(s) => {
-                let Ok(name) = s.base_token() else {
-                    return Self::Unknown;
-                };
+                let name = s.base_token().ok()?;
                 let name = name.text_trimmed();
                 if let Some(entry) = STATIC_UTILITIES
                     .get(name)
@@ -240,13 +327,9 @@ impl SortKey {
             }
 
             AnyTwCandidate::TwFunctionalCandidate(f) => {
-                let Ok(base) = f.base_token() else {
-                    return Self::Unknown;
-                };
+                let base = f.base_token().ok()?;
 
-                let Ok(value) = f.value() else {
-                    return Self::Unknown;
-                };
+                let value = f.value().ok()?;
 
                 // Tailwind resolves a candidate's full name as a static
                 // utility before trying functional roots: `w-full`,
@@ -261,13 +344,11 @@ impl SortKey {
                 {
                     Some((pool_signature(entry.sig), entry.count))
                 } else {
-                    let Some(entry) = FUNCTIONAL_UTILITIES.get(base.text_trimmed()) else {
-                        return Self::Unknown;
-                    };
+                    let entry = FUNCTIONAL_UTILITIES.get(base.text_trimmed())?;
 
                     let (named_branches, arbitrary_branches) = if is_negative {
                         match entry.negative {
-                            None => return Self::Unknown,
+                            None => return None,
                             Some(Negative::SameBranches) => {
                                 (entry.named_branches, entry.arbitrary_branches)
                             }
@@ -291,18 +372,15 @@ impl SortKey {
             }
         };
 
-        match placement {
-            None => Self::Unknown,
-            Some((signature, count)) => Self::Known {
-                signature,
-                count,
-                name: NameKey {
-                    negative: is_negative,
-                    text: Some(inner.syntax().text_trimmed()),
-                },
-                important: is_important,
+        placement.map(|(signature, count)| Self {
+            signature,
+            count,
+            name: NameKey {
+                negative: is_negative,
+                text: Some(inner.syntax().text_trimmed()),
             },
-        }
+            important: is_important,
+        })
     }
 }
 
@@ -319,19 +397,22 @@ fn compare(a: &SortKey, b: &SortKey) -> Ordering {
         (SortKey::Known { .. }, SortKey::Unknown) => Ordering::Greater,
         (
             SortKey::Known {
+                variant_bits: v1,
                 signature: s1,
                 count: c1,
                 name: n1,
                 important: i1,
             },
             SortKey::Known {
+                variant_bits: v2,
                 signature: s2,
                 count: c2,
                 name: n2,
                 important: i2,
             },
-        ) => s1
-            .cmp(s2)
+        ) => v1
+            .cmp_numeric(v2)
+            .then_with(|| s1.cmp(s2))
             // Wider utilities (e.g. `sr-only` setting 9 properties) win
             // a signature tie so they sort before narrower utilities.
             .then_with(|| c2.cmp(c1))
@@ -511,6 +592,7 @@ mod tests {
 
     fn known(property_idx: u16, property_count: u8) -> SortKey {
         SortKey::Known {
+            variant_bits: VariantBits::default(),
             signature: Signature::Property(property_idx),
             count: property_count,
             name: NameKey::default(),
@@ -604,6 +686,7 @@ mod tests {
     fn compare_breaks_exact_key_tie_plain_before_important() {
         let plain = known(5, 1);
         let important = SortKey::Known {
+            variant_bits: VariantBits::default(),
             signature: Signature::Property(5),
             count: 1,
             name: NameKey::default(),
@@ -726,7 +809,12 @@ mod tests {
             ArbitraryBranch::Typed(CssDataType::Number, 10, 1),
             ArbitraryBranch::Fallback(20, 1),
         ];
-        let full = parse_tailwind("p-[10px]").tree().candidates().iter().next().unwrap();
+        let full = parse_tailwind("p-[10px]")
+            .tree()
+            .candidates()
+            .iter()
+            .next()
+            .unwrap();
         let full = full.as_tw_full_candidate().unwrap();
         let candidate = full.candidate().unwrap();
         let AnyTwCandidate::TwFunctionalCandidate(functional) = candidate else {
@@ -770,7 +858,10 @@ mod tests {
         // because dispatch is by parser node kind, not text scanning.
         let (value, modifier) = functional_parts("p-abc");
         let branches = &[NamedBranch::Typed(NamedValueType::Number, 1, 1)];
-        assert_eq!(resolve_named_branch(branches, &value, modifier.as_ref()), None);
+        assert_eq!(
+            resolve_named_branch(branches, &value, modifier.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -838,6 +929,7 @@ mod tests {
             count,
             name,
             important: false,
+            ..
         } = classify("flex")
         else {
             panic!("expected `flex` to classify as a plain known key");
@@ -845,6 +937,7 @@ mod tests {
         assert_eq!(
             classify("flex!"),
             SortKey::Known {
+                variant_bits: VariantBits::default(),
                 signature,
                 count,
                 name,
@@ -872,8 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn important_with_variants_is_still_unknown() {
-        // Variant weight is the remaining TODO; `!` must not bypass it.
+    fn direct_classification_requires_no_variants() {
+        // Variant ordering needs the full class list to build group bits.
         assert_eq!(classify("hover:flex!"), SortKey::Unknown);
     }
 
