@@ -217,6 +217,23 @@
 	"mt-4 -mt-2!",                  // negative + important
 	"not-a-class! flex",            // unknown base stays front even with `!`
 
+	// ─── variants ─────────────────────────────────────────────────
+	// Variant bits sort before the existing utility dimensions.
+
+	"hover:flex flex",
+	"focus:flex hover:flex flex",
+	"hover:flex [&:hover]:flex flex",
+	"data-[state=open]:flex aria-checked:flex flex",
+	"nth-last-3:flex nth-2:flex flex",
+	"peer-focus:flex group-hover:flex flex",
+	"has-[:checked]:flex not-hover:flex flex",
+	"md:flex sm:flex flex max-lg:flex max-sm:flex min-lg:flex",
+	"md:hover:flex hover:flex flex md:flex",
+	"p-2! flex!",
+	"p-2! hover:flex! flex!",
+	"w-full! flex! p-4!",
+	"flex [color:red]!",
+
 	// ─── real-world strings (shadcn/ui v4, MIT) ─────────────────────
 	// Inputs scrambled; output captured by snapshot.
 	// Source: github.com/shadcn-ui/ui registry/new-york-v4.
